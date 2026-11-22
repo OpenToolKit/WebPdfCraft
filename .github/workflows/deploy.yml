@@ -1,0 +1,203 @@
+name: Build and Deploy PdfCraft PWA
+
+on:
+  push:
+    branches: ["main"]
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
+  schedule:
+    # Check daily at 06:00 UTC for updates to the target version in VERSION (set VERSION to "latest" to track upstream releases).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream PdfCraft release tag (e.g. v0.21.0 or latest; blank = VERSION file)"
+        required: false
+        default: ""
+
+# Deny all permissions by default; grant least-privilege scopes per job.
+permissions: {}
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    outputs:
+      should_deploy: ${{ steps.check.outputs.should_deploy }}
+      pages_enabled: ${{ steps.check.outputs.pages_enabled }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout scaffolding
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Determine target upstream version and Pages status
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.error, urllib.parse, urllib.request
+
+          VERSION_ARG_RE = re.compile(r"^(latest|v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*)$")
+          TAG_RE = re.compile(r"^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$")
+
+          headers = {"User-Agent": "pdfcraft-pwa-gha", "Accept": "application/vnd.github+json"}
+          token = os.environ.get("GITHUB_TOKEN")
+          if token:
+              headers["Authorization"] = f"Bearer {token}"
+
+          def api_get(url):
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
+                  return json.loads(r.read(2 * 1024 * 1024).decode("utf-8"))
+
+          # 1. Check whether GitHub Pages (Actions mode) is enabled on this repo.
+          pages_enabled = False
+          pages_url = ""
+          repo = os.environ["GITHUB_REPOSITORY"]
+          try:
+              pages_info = api_get(f"https://api.github.com/repos/{repo}/pages")
+              candidate_url = (pages_info.get("html_url") or "").rstrip("/")
+              if candidate_url.startswith("https://"):
+                  pages_url = candidate_url
+              pages_enabled = pages_info.get("build_type") == "workflow"
+              if not pages_enabled:
+                  print(
+                      f"::notice::GitHub Pages is enabled with build_type={pages_info.get('build_type')!r}; "
+                      "switch Settings -> Pages -> Source to 'GitHub Actions' to enable deployment."
+                  )
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  print(
+                      "::notice::GitHub Pages is not enabled yet for this repository. "
+                      "Will run build & smoke test and skip deployment."
+                  )
+              else:
+                  print(f"::warning::Could not query GitHub Pages status (HTTP {exc.code}); skipping deploy.")
+          except (urllib.error.URLError, TimeoutError) as exc:
+              print(f"::warning::Network error querying GitHub Pages status ({exc}); skipping deploy.")
+
+          # 2. Resolve and strictly validate target upstream PdfCraft release tag.
+          req_version = (os.environ.get("INPUT_VERSION") or "").strip()
+          if not req_version:
+              if os.path.isfile("VERSION"):
+                  req_version = open("VERSION", encoding="utf-8").read().strip()
+              else:
+                  req_version = "latest"
+
+          if not VERSION_ARG_RE.fullmatch(req_version):
+              raise SystemExit(f"error: invalid version input: {req_version!r}")
+
+          if req_version == "latest":
+              api_url = "https://api.github.com/repos/storytold/pdfcraft/releases/latest"
+          else:
+              tag_param = req_version if req_version.startswith("v") else f"v{req_version}"
+              api_url = (
+                  "https://api.github.com/repos/storytold/pdfcraft/releases/tags/"
+                  + urllib.parse.quote(tag_param, safe="")
+              )
+
+          tag = str(api_get(api_url).get("tag_name") or "")
+          if not TAG_RE.fullmatch(tag):
+              raise SystemExit(f"error: upstream release tag failed validation: {tag!r}")
+          target_version = tag.lstrip("v")
+
+          # 3. On scheduled checks, skip rebuilding if live site already serves this version.
+          should_build = True
+          if os.environ.get("EVENT_NAME") == "schedule" and pages_url:
+              live_info_url = f"{pages_url}/build-info.json"
+              try:
+                  req = urllib.request.Request(live_info_url, headers={"User-Agent": "pdfcraft-pwa-gha"})
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      live = json.loads(r.read(65536).decode("utf-8"))
+                  if live.get("version") == target_version:
+                      print(f"Live site already serves PdfCraft v{target_version}; skipping scheduled build.")
+                      should_build = False
+              except Exception as exc:
+                  print(f"Could not read live build-info.json ({exc}); proceeding with build.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"version={tag}\n")
+              out.write(f"should_deploy={'true' if should_build else 'false'}\n")
+              out.write(f"pages_enabled={'true' if pages_enabled else 'false'}\n")
+          print(f"Target version: {tag}, should_build={should_build}, pages_enabled={pages_enabled}")
+          PY
+
+      - name: Build PWA bundle from GPG-verified upstream release artifact
+        if: steps.check.outputs.should_deploy == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET_VERSION: ${{ steps.check.outputs.version }}
+        run: python3 scripts/build.py --version "$TARGET_VERSION" --out dist
+
+      - name: Run static, MIME, and SRI checks
+        if: steps.check.outputs.should_deploy == 'true'
+        run: python3 scripts/smoke_test.py --dist dist --skip-browser
+
+      - name: Upload built dist for isolated smoke test
+        if: steps.check.outputs.should_deploy == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pdfcraft-dist
+          path: dist
+          retention-days: 1
+
+      - name: Upload Pages artifact
+        if: steps.check.outputs.should_deploy == 'true' && steps.check.outputs.pages_enabled == 'true'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist
+
+  smoke-test:
+    needs: build
+    if: needs.build.outputs.should_deploy == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout test script and lockfile
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/smoke_test.py
+            requirements-test.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Download built dist artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: pdfcraft-dist
+          path: dist
+
+      - name: Install hash-pinned Playwright dependencies
+        run: python3 -m pip install --quiet --require-hashes --no-deps -r requirements-test.txt
+
+      - name: Run headless Chromium PWA smoke test
+        run: python3 scripts/smoke_test.py --dist dist
+
+  deploy:
+    needs: [build, smoke-test]
+    if: needs.build.outputs.should_deploy == 'true' && needs.build.outputs.pages_enabled == 'true'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
