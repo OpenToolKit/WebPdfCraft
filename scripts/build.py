@@ -414,17 +414,21 @@ def extract_zip_flattened(zip_path: Path, out_dir: Path) -> None:
                 shutil.copy2(item, dest)
 
 
-def copy_pwa_assets(out_dir: Path) -> None:
+def copy_pwa_assets(out_dir: Path) -> str:
     shutil.copy2(PWA_DIR / "manifest.webmanifest", out_dir / "manifest.webmanifest")
-    shutil.copy2(PWA_DIR / "pwa-register.js", out_dir / "pwa-register.js")
+    reg_src = PWA_DIR / "pwa-register.js"
+    reg_hash = sha256_file(reg_src)[:8]
+    reg_filename = f"pwa-register-{reg_hash}.js"
+    shutil.copy2(reg_src, out_dir / reg_filename)
     icons_dest = out_dir / "icons"
     if icons_dest.exists():
         shutil.rmtree(icons_dest)
     shutil.copytree(PWA_DIR / "icons", icons_dest, symlinks=False)
+    return reg_filename
 
 
-class HeadCloseLocator(html.parser.HTMLParser):
-    """Locate the character offset of the closing </head> tag outside comments/scripts."""
+class HtmlInjectionLocator(html.parser.HTMLParser):
+    """Locate </head> start offset and <body> opening tag end offset outside comments/scripts."""
 
     def __init__(self, text: str) -> None:
         super().__init__(convert_charrefs=False)
@@ -433,14 +437,25 @@ class HeadCloseLocator(html.parser.HTMLParser):
             if ch == "\n":
                 self._line_starts.append(idx + 1)
         self.close_head_offset: int | None = None
+        self.open_body_end_offset: int | None = None
+
+    def _offset(self) -> int:
+        line, col = self.getpos()
+        return self._line_starts[line - 1] + col
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "body" and self.open_body_end_offset is None:
+            raw_tag = self.get_starttag_text()
+            if raw_tag is not None:
+                self.open_body_end_offset = self._offset() + len(raw_tag)
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "head" and self.close_head_offset is None:
-            line, col = self.getpos()
-            self.close_head_offset = self._line_starts[line - 1] + col
+            self.close_head_offset = self._offset()
 
 
-def build_pwa_head_snippet(register_sri: str) -> str:
+def build_pwa_head_snippet(register_filename: str, register_sri: str, splash_css: str) -> str:
+    indented_css = "\n".join(f"      {line}" if line else "" for line in splash_css.strip().splitlines())
     return (
         f"    {PWA_HEAD_MARKER}\n"
         '    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f1f1f3" />\n'
@@ -453,21 +468,45 @@ def build_pwa_head_snippet(register_sri: str) -> str:
         '    <link rel="icon" type="image/png" sizes="32x32" href="./icons/favicon-32.png" />\n'
         '    <link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png" />\n'
         '    <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />\n'
-        f'    <script src="./pwa-register.js" integrity="{register_sri}" crossorigin="anonymous" defer></script>'
+        f'    <style id="pdfcraft-splash-style">\n{indented_css}\n    </style>\n'
+        f'    <script src="./{register_filename}" integrity="{register_sri}" crossorigin="anonymous" defer></script>'
     )
 
 
-def patch_index_html(index_path: Path, register_sri: str) -> None:
+def patch_index_html(index_path: Path, register_filename: str, register_sri: str) -> None:
     content = index_path.read_text(encoding="utf-8")
     if PWA_HEAD_MARKER in content:
         return
-    locator = HeadCloseLocator(content)
+    locator = HtmlInjectionLocator(content)
     locator.feed(content)
     if locator.close_head_offset is None:
         raise SystemExit(f"error: closing </head> tag not found in {index_path}")
-    snippet = build_pwa_head_snippet(register_sri)
-    offset = locator.close_head_offset
-    patched = f"{content[:offset]}{snippet}\n  {content[offset:]}"
+    if locator.open_body_end_offset is None:
+        raise SystemExit(f"error: opening <body> tag not found in {index_path}")
+
+    splash_css_path = PWA_DIR / "splash.css"
+    splash_html_path = PWA_DIR / "splash.html"
+    if not splash_css_path.is_file():
+        raise SystemExit(f"error: missing splash stylesheet: {splash_css_path}")
+    if not splash_html_path.is_file():
+        raise SystemExit(f"error: missing splash markup: {splash_html_path}")
+
+    splash_css = splash_css_path.read_text(encoding="utf-8")
+    if re.search(r"</style", splash_css, re.IGNORECASE):
+        raise SystemExit(f"error: splash stylesheet must not contain '</style': {splash_css_path}")
+    splash_html = splash_html_path.read_text(encoding="utf-8").strip()
+    head_snippet = build_pwa_head_snippet(register_filename, register_sri, splash_css)
+
+    # Insert from back to front so earlier offsets stay valid.
+    body_off = locator.open_body_end_offset
+    head_off = locator.close_head_offset
+    if head_off >= body_off:
+        raise SystemExit(f"error: unexpected HTML tag order (</head> after <body>) in {index_path}")
+    patched = (
+        f"{content[:head_off]}{head_snippet}\n  "
+        f"{content[head_off:body_off]}\n    {splash_html}"
+        f"{content[body_off:]}"
+    )
     index_path.write_text(patched, encoding="utf-8")
 
 
@@ -593,10 +632,10 @@ def main() -> int:
     out_dir = args.out.resolve()
     print(f"Building PdfCraft PWA v{version} -> {out_dir}")
     extract_zip_flattened(zip_path, out_dir)
-    copy_pwa_assets(out_dir)
+    register_filename = copy_pwa_assets(out_dir)
 
-    register_sri = sri_sha384_file(out_dir / "pwa-register.js")
-    patch_index_html(out_dir / "index.html", register_sri)
+    register_sri = sri_sha384_file(out_dir / register_filename)
+    patch_index_html(out_dir / "index.html", register_filename, register_sri)
 
     core_assets, model_hashes, core_hash, model_hash = collect_cache_lists(out_dir)
     core_suffix, models_suffix = render_service_worker(
@@ -608,6 +647,7 @@ def main() -> int:
         "upstream_repo": args.repo,
         "source_asset": zip_path.name,
         "source_sha256": zip_sha,
+        "register_script": f"./{register_filename}",
         "core_cache_suffix": core_suffix,
         "models_cache_suffix": models_suffix,
         "core_assets_count": len(core_assets),

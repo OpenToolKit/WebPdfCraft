@@ -1,4 +1,4 @@
-name: Build and Deploy PdfCraft PWA
+name: Build and Deploy WebPdfCraft
 
 on:
   push:
@@ -26,6 +26,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
       pages: read
@@ -163,6 +164,7 @@ jobs:
     needs: build
     if: needs.build.outputs.should_deploy == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -194,6 +196,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       pages: write
       id-token: write

@@ -2,11 +2,12 @@
 """End-to-end smoke test for a built PdfCraft PWA bundle.
 
 Checks:
-  1. Required files, manifest JSON, icons, HTTP MIME types, and SRI hashes
-     on both <link> and <script> tags.
-  2. (With Playwright + Chromium) Live WebAssembly boot via ?control,
-     opening a generated 1-page PDF via ?file=, Service Worker activation
-     and core cache population, and a full offline reload from SW cache.
+  1. Required files, splash markup placement, manifest JSON, icons, HTTP MIME
+     types, SRI hashes on <link> and <script> tags, and ONNX model hashes.
+  2. (With Playwright + Chromium) Live WebAssembly boot via ?control, splash
+     screen dismissal, opening a generated 1-page PDF via ?file=, Service Worker
+     activation, core precache + background OCR model warmup, and a full offline
+     reload (including offline fetches of ./models/*.onnx).
 
 Usage:
   python3 scripts/smoke_test.py --dist dist
@@ -34,7 +35,6 @@ REQUIRED_FILES = (
     "index.html",
     "manifest.webmanifest",
     "sw.js",
-    "pwa-register.js",
     "build-info.json",
 )
 
@@ -86,28 +86,42 @@ def make_minimal_pdf() -> bytes:
     return bytes(buf)
 
 
-class SriCollector(html.parser.HTMLParser):
-    """Collect (url, integrity) pairs from <link> and <script> tags."""
+class HtmlValidator(html.parser.HTMLParser):
+    """Collect SRI pairs, manifest link, register script, and splash placement."""
 
-    def __init__(self) -> None:
+    def __init__(self, expected_register_script: str) -> None:
         super().__init__()
+        self.expected_register_script = expected_register_script
         self.items: list[tuple[str, str]] = []
         self.has_manifest = False
         self.has_register_script = False
+        self._in_body = False
+        self.splash_in_body_count = 0
+        self.splash_total_count = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_map = {k.lower(): (v or "") for k, v in attrs}
         t = tag.lower()
+        if t == "body":
+            self._in_body = True
+        if attr_map.get("id") == "pdfcraft-splash":
+            self.splash_total_count += 1
+            if self._in_body:
+                self.splash_in_body_count += 1
         if t == "link":
             if attr_map.get("rel") == "manifest" and attr_map.get("href") == "./manifest.webmanifest":
                 self.has_manifest = True
             if attr_map.get("href") and attr_map.get("integrity"):
                 self.items.append((attr_map["href"], attr_map["integrity"]))
         elif t == "script":
-            if attr_map.get("src") == "./pwa-register.js":
+            if attr_map.get("src") == self.expected_register_script:
                 self.has_register_script = True
             if attr_map.get("src") and attr_map.get("integrity"):
                 self.items.append((attr_map["src"], attr_map["integrity"]))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "body":
+            self._in_body = False
 
 
 def start_server(dist_dir: Path, test_pdf: bytes) -> tuple[http.server.ThreadingHTTPServer, str]:
@@ -201,13 +215,21 @@ def run_static_checks(dist_dir: Path, base_url: str) -> dict:
             raise AssertionError(f"Missing required file: {path}")
 
     build_info = json.loads((dist_dir / "build-info.json").read_text(encoding="utf-8"))
+    register_script = build_info.get("register_script", "./pwa-register.js")
+    reg_file = dist_dir / register_script.removeprefix("./")
+    if not reg_file.is_file():
+        raise AssertionError(f"Missing register script: {reg_file}")
 
     status, _, html_bytes = http_get(base_url, "index.html")
     assert status == 200, f"index.html returned HTTP {status}"
-    collector = SriCollector()
+    collector = HtmlValidator(register_script)
     collector.feed(html_bytes.decode("utf-8"))
     assert collector.has_manifest, "manifest link missing from index.html"
-    assert collector.has_register_script, "pwa-register.js script missing from index.html"
+    assert collector.has_register_script, f"{register_script} script missing from index.html"
+    assert collector.splash_total_count == 1 and collector.splash_in_body_count == 1, (
+        f"Expected #pdfcraft-splash once inside <body>, got total={collector.splash_total_count}, "
+        f"in_body={collector.splash_in_body_count}"
+    )
     assert collector.items, "Expected at least one SRI integrity attribute in index.html"
 
     checked_register_sri = False
@@ -215,9 +237,9 @@ def run_static_checks(dist_dir: Path, base_url: str) -> dict:
         st, _, data = http_get(base_url, target)
         assert st == 200, f"{target} returned HTTP {st}"
         verify_sri(data, integrity, target)
-        if target == "./pwa-register.js":
+        if target == register_script:
             checked_register_sri = True
-    assert checked_register_sri, "pwa-register.js is missing an SRI integrity attribute"
+    assert checked_register_sri, f"{register_script} is missing an SRI integrity attribute"
 
     st, ct, manifest_bytes = http_get(base_url, "manifest.webmanifest")
     assert st == 200 and "manifest+json" in ct, f"manifest HTTP {st} ({ct})"
@@ -283,7 +305,7 @@ def wait_for_pdfcraft_api(page, timeout_ms: int = 60_000) -> dict:
     return state
 
 
-def run_browser_checks(base_url: str, build_info: dict, timeout_ms: int) -> None:
+def run_browser_checks(dist_dir: Path, base_url: str, build_info: dict, timeout_ms: int) -> None:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -322,41 +344,70 @@ def run_browser_checks(base_url: str, build_info: dict, timeout_ms: int) -> None
             state = page.evaluate("async () => await window.pdfcraft.docInspect()")
             opened = "__smoke_test.pdf" in json.dumps(state)
         assert opened, f"Expected __smoke_test.pdf in docInspect() state, got: {json.dumps(state)[:500]}"
-        print("[OK] PdfCraft booted and opened __smoke_test.pdf")
+        page.wait_for_function("() => !document.getElementById('pdfcraft-splash')", timeout=10_000)
+        print("[OK] PdfCraft booted, dismissed splash screen, and opened __smoke_test.pdf")
 
-        # 2. Verify Service Worker activation and scoped precache contents
-        print("[2/3] Waiting for Service Worker activation and core precache...")
+        # 2. Verify Service Worker activation, core precache, and background OCR model warmup
+        print("[2/3] Waiting for Service Worker activation, core precache, and OCR model cache...")
+        expected_suffix = build_info["core_cache_suffix"]
+        expected_count = build_info["core_assets_count"]
+        expected_models_suffix = build_info["models_cache_suffix"]
+        expected_models_count = build_info["model_assets_count"]
+
         sw_info = page.evaluate(
-            """async () => {
-                const reg = await navigator.serviceWorker.ready;
+            """async ([modelsSuffix, modelsCount]) => {
+                const withTimeout = (promise, ms, label) =>
+                    Promise.race([
+                        promise,
+                        new Promise((_, reject) =>
+                            setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms)
+                        ),
+                    ]);
+                const reg = await withTimeout(navigator.serviceWorker.ready, 30000, 'serviceWorker.ready');
                 if (reg.active && reg.active.state !== 'activated') {
-                    await new Promise((resolve) => {
-                        const sw = reg.active;
-                        const onState = () => {
-                            if (sw.state === 'activated' || sw.state === 'redundant') {
-                                sw.removeEventListener('statechange', onState);
-                                resolve();
-                            }
-                        };
-                        sw.addEventListener('statechange', onState);
-                        onState();
-                    });
+                    await withTimeout(
+                        new Promise((resolve) => {
+                            const sw = reg.active;
+                            const onState = () => {
+                                if (sw.state === 'activated' || sw.state === 'redundant') {
+                                    sw.removeEventListener('statechange', onState);
+                                    resolve();
+                                }
+                            };
+                            sw.addEventListener('statechange', onState);
+                            onState();
+                        }),
+                        15000,
+                        'serviceWorker activation'
+                    );
                 }
-                const keys = await caches.keys();
-                const counts = {};
-                for (const k of keys) {
-                    const c = await caches.open(k);
-                    counts[k] = (await c.keys()).length;
+                const deadline = Date.now() + 20000;
+                const readCaches = async () => {
+                    const keys = await caches.keys();
+                    const counts = {};
+                    for (const k of keys) {
+                        const c = await caches.open(k);
+                        counts[k] = (await c.keys()).length;
+                    }
+                    return counts;
+                };
+                let counts = await readCaches();
+                while (Date.now() < deadline) {
+                    const ready = Object.entries(counts).some(
+                        ([k, n]) => k.startsWith('pdfcraft-') && k.endsWith('-' + modelsSuffix) && n === modelsCount
+                    );
+                    if (ready) break;
+                    await new Promise((r) => setTimeout(r, 250));
+                    counts = await readCaches();
                 }
                 return {
                     activeState: reg.active ? reg.active.state : null,
                     controlled: Boolean(navigator.serviceWorker.controller),
                     caches: counts,
                 };
-            }"""
+            }""",
+            [expected_models_suffix, expected_models_count],
         )
-        expected_suffix = build_info["core_cache_suffix"]
-        expected_count = build_info["core_assets_count"]
         assert sw_info["activeState"] == "activated", f"SW not activated: {sw_info}"
         matching = [
             (k, cnt)
@@ -368,9 +419,24 @@ def run_browser_checks(base_url: str, build_info: dict, timeout_ms: int) -> None
         assert cached_count == expected_count, (
             f"Expected {expected_count} cached files in {cache_name}, got {cached_count}"
         )
+        matching_models = [
+            (k, cnt)
+            for k, cnt in sw_info["caches"].items()
+            if k.startswith("pdfcraft-") and k.endswith(f"-{expected_models_suffix}")
+        ]
+        assert matching_models, (
+            f"Expected OCR models cache ending with -{expected_models_suffix} in {sw_info['caches']}"
+        )
+        models_cache_name, models_cached_count = matching_models[0]
+        assert models_cached_count == expected_models_count, (
+            f"Expected {expected_models_count} cached OCR models in {models_cache_name}, got {models_cached_count}"
+        )
         assert not page_errors, f"Uncaught page errors during online boot: {page_errors}"
         assert not console_errors, f"Console errors during online boot: {console_errors}"
-        print(f"[OK] Service Worker active; {cache_name} holds {cached_count} cached assets")
+        print(
+            f"[OK] Service Worker active; {cache_name} ({cached_count} assets) + "
+            f"{models_cache_name} ({models_cached_count} OCR models) ready offline"
+        )
 
         # 3. Offline reload test
         print("[3/3] Switching offline and reloading from Service Worker cache...")
@@ -380,6 +446,30 @@ def run_browser_checks(base_url: str, build_info: dict, timeout_ms: int) -> None
         page.goto(f"{base_url}/?control", wait_until="domcontentloaded", timeout=timeout_ms)
         offline_state = wait_for_pdfcraft_api(page, timeout_ms=timeout_ms)
         assert isinstance(offline_state, dict), "Offline docInspect() failed"
+        page.wait_for_function("() => !document.getElementById('pdfcraft-splash')", timeout=10_000)
+
+        # Verify OCR ONNX models can be fetched offline from MODELS_CACHE with exact byte size.
+        expected_model_sizes = {
+            f"./models/{p.name}": p.stat().st_size
+            for p in sorted((dist_dir / "models").glob("*.onnx"))
+        }
+        offline_models = page.evaluate(
+            """async (urls) => {
+                const out = {};
+                for (const u of urls) {
+                    const r = await fetch(u, { cache: 'no-cache' });
+                    const buf = await r.arrayBuffer();
+                    out[u] = { status: r.status, size: buf.byteLength };
+                }
+                return out;
+            }""",
+            list(expected_model_sizes.keys()),
+        )
+        for model_url, expected_size in expected_model_sizes.items():
+            got = offline_models.get(model_url)
+            assert got and got["status"] == 200 and got["size"] == expected_size, (
+                f"Offline model fetch mismatch for {model_url}: got {got}, expected size {expected_size}"
+            )
 
         # Allow only the expected browser message when the background SW update check fails offline.
         unexpected_console = [
@@ -392,7 +482,9 @@ def run_browser_checks(base_url: str, build_info: dict, timeout_ms: int) -> None
         ]
         assert not page_errors, f"Uncaught page errors during offline boot: {page_errors}"
         assert not unexpected_console, f"Console errors during offline boot: {unexpected_console}"
-        print("[OK] Offline reload succeeded cleanly from Service Worker cache")
+        print(
+            f"[OK] Offline reload + {len(expected_model_sizes)} OCR model fetches succeeded from Service Worker cache"
+        )
 
         browser.close()
 
@@ -422,7 +514,7 @@ def main() -> int:
     try:
         build_info = run_static_checks(dist_dir, base_url)
         if not args.skip_browser:
-            run_browser_checks(base_url, build_info, timeout_ms=args.timeout_ms)
+            run_browser_checks(dist_dir, base_url, build_info, timeout_ms=args.timeout_ms)
     finally:
         server.shutdown()
         server.server_close()

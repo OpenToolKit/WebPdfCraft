@@ -10,7 +10,6 @@ const MODEL_HASHES = __MODEL_HASHES__;
 const UNHASHED_CORE = new Set([
   './index.html',
   './manifest.webmanifest',
-  './pwa-register.js',
 ]);
 
 const normalizeScope = (scope) => (scope.endsWith('/') ? scope : `${scope}/`);
@@ -52,6 +51,66 @@ const isCacheableResponse = (response, expectHtml) => {
 const sha256Hex = async (buffer) => {
   const digest = await crypto.subtle.digest('SHA-256', buffer);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+};
+
+// Deduplicate concurrent model downloads (background warmup vs user-triggered OCR)
+// and avoid response.clone() double-buffering by consuming the response once.
+const inflightModels = new Map();
+
+const loadVerifiedModel = (url, expectedSha, cache) => {
+  const existing = inflightModels.get(url);
+  if (existing) return existing;
+
+  const task = (async () => {
+    const cleanReq = new Request(url, {
+      credentials: 'same-origin',
+      redirect: 'error',
+    });
+    const response = await fetch(cleanReq);
+    if (!isCacheableResponse(response, false)) {
+      return { ok: false, status: response.status, headers: response.headers, buf: await response.arrayBuffer() };
+    }
+
+    const buf = await response.arrayBuffer();
+    if (self.crypto && self.crypto.subtle && expectedSha) {
+      const actualSha = await sha256Hex(buf);
+      if (actualSha !== expectedSha) {
+        return { ok: false, status: 502, headers: new Headers({ 'Content-Type': 'text/plain' }), buf: null };
+      }
+    }
+
+    const headers = new Headers(response.headers);
+    const toStore = new Response(buf, { status: 200, statusText: 'OK', headers });
+    await cache.put(url, toStore).catch(() => { });
+    return { ok: true, status: 200, headers, buf };
+  })().finally(() => {
+    inflightModels.delete(url);
+  });
+
+  inflightModels.set(url, task);
+  return task;
+};
+
+let modelWarmupPromise = null;
+
+const warmModelsCache = () => {
+  if (modelWarmupPromise) return modelWarmupPromise;
+  modelWarmupPromise = (async () => {
+    const entries = Array.from(MODEL_HASH_BY_URL.entries());
+    if (!entries.length) return;
+    const cache = await caches.open(MODELS_CACHE);
+    for (const [url, expectedSha] of entries) {
+      try {
+        if (await cache.match(url)) continue;
+        await loadVerifiedModel(url, expectedSha, cache);
+      } catch {
+        // Keep warming remaining models if one transfer fails transiently.
+      }
+    }
+  })().finally(() => {
+    modelWarmupPromise = null;
+  });
+  return modelWarmupPromise;
 };
 
 const isUnhashedAsset = (relPath) =>
@@ -102,6 +161,8 @@ self.addEventListener('message', (event) => {
 
   if (event.data.type === 'SKIP_WAITING') {
     self.skipWaiting();
+  } else if (event.data.type === 'WARM_MODELS') {
+    event.waitUntil(warmModelsCache().catch(() => { }));
   } else if (event.data.type === 'GET_VERSION' && event.ports && event.ports[0]) {
     event.ports[0].postMessage({ version: APP_VERSION });
   }
@@ -131,8 +192,8 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // OCR ONNX models: cached on first use after verifying SHA-256 against the
-  // build-time digest so captive portals or corrupt transfers cannot poison the cache.
+  // OCR ONNX models: cached in the background after first load (and on demand)
+  // after verifying SHA-256 against the build-time digest.
   if (MODEL_HASH_BY_URL.has(normalizedHref)) {
     const expectedSha = MODEL_HASH_BY_URL.get(normalizedHref);
     event.respondWith(
@@ -140,32 +201,18 @@ self.addEventListener('fetch', (event) => {
         const cached = await cache.match(normalizedHref);
         if (cached) return cached;
 
-        const cleanReq = new Request(normalizedHref, {
-          credentials: 'same-origin',
-          redirect: 'error',
-        });
-        const response = await fetch(cleanReq);
-        if (!isCacheableResponse(response, false)) {
-          return response;
-        }
-
-        if (self.crypto && self.crypto.subtle && expectedSha) {
-          const buf = await response.clone().arrayBuffer();
-          const actualSha = await sha256Hex(buf);
-          if (actualSha !== expectedSha) {
-            return new Response('Model integrity check failed', { status: 502 });
-          }
-          const verified = new Response(buf, {
-            status: 200,
-            statusText: 'OK',
-            headers: response.headers,
+        const result = await loadVerifiedModel(normalizedHref, expectedSha, cache);
+        if (!result.ok) {
+          return new Response(result.buf || 'Model integrity check failed', {
+            status: result.status,
+            headers: result.headers,
           });
-          event.waitUntil(cache.put(normalizedHref, verified.clone()).catch(() => {}));
-          return verified;
         }
-
-        event.waitUntil(cache.put(normalizedHref, response.clone()).catch(() => {}));
-        return response;
+        return new Response(result.buf, {
+          status: 200,
+          statusText: 'OK',
+          headers: result.headers,
+        });
       })
     );
     return;
@@ -184,7 +231,7 @@ self.addEventListener('fetch', (event) => {
         });
         const response = await fetch(cleanReq);
         if (isCacheableResponse(response, normalizedHref === INDEX_URL)) {
-          event.waitUntil(cache.put(normalizedHref, response.clone()).catch(() => {}));
+          event.waitUntil(cache.put(normalizedHref, response.clone()).catch(() => { }));
         }
         return response;
       })
