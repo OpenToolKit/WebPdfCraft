@@ -428,7 +428,7 @@ def copy_pwa_assets(out_dir: Path) -> str:
 
 
 class HtmlInjectionLocator(html.parser.HTMLParser):
-    """Locate </head> start offset and <body> opening tag end offset outside comments/scripts."""
+    """Locate <meta charset> / <head> open end, </head> start, and <body> open end outside comments/scripts."""
 
     def __init__(self, text: str) -> None:
         super().__init__(convert_charrefs=False)
@@ -436,6 +436,9 @@ class HtmlInjectionLocator(html.parser.HTMLParser):
         for idx, ch in enumerate(text):
             if ch == "\n":
                 self._line_starts.append(idx + 1)
+        self._in_head = False
+        self.open_head_end_offset: int | None = None
+        self.charset_meta_end_offset: int | None = None
         self.close_head_offset: int | None = None
         self.open_body_end_offset: int | None = None
 
@@ -444,14 +447,31 @@ class HtmlInjectionLocator(html.parser.HTMLParser):
         return self._line_starts[line - 1] + col
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.lower() == "body" and self.open_body_end_offset is None:
+        t = tag.lower()
+        if t == "head" and self.open_head_end_offset is None:
+            self._in_head = True
+            raw_tag = self.get_starttag_text()
+            if raw_tag is not None:
+                self.open_head_end_offset = self._offset() + len(raw_tag)
+        elif t == "meta" and self._in_head and self.charset_meta_end_offset is None:
+            if any(k.lower() == "charset" for k, _ in attrs):
+                raw_tag = self.get_starttag_text()
+                if raw_tag is not None:
+                    self.charset_meta_end_offset = self._offset() + len(raw_tag)
+        elif t == "body" and self.open_body_end_offset is None:
             raw_tag = self.get_starttag_text()
             if raw_tag is not None:
                 self.open_body_end_offset = self._offset() + len(raw_tag)
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "head" and self.close_head_offset is None:
+            self._in_head = False
             self.close_head_offset = self._offset()
+
+
+def build_offline_lock_snippet(offline_lock_js: str) -> str:
+    indented = "\n".join(f"      {line}" if line else "" for line in offline_lock_js.strip().splitlines())
+    return f'    <script id="pdfcraft-offline-lock">\n{indented}\n    </script>'
 
 
 def build_pwa_head_snippet(register_filename: str, register_sri: str, splash_css: str) -> str:
@@ -479,6 +499,8 @@ def patch_index_html(index_path: Path, register_filename: str, register_sri: str
         return
     locator = HtmlInjectionLocator(content)
     locator.feed(content)
+    if locator.open_head_end_offset is None:
+        raise SystemExit(f"error: opening <head> tag not found in {index_path}")
     if locator.close_head_offset is None:
         raise SystemExit(f"error: closing </head> tag not found in {index_path}")
     if locator.open_body_end_offset is None:
@@ -486,32 +508,47 @@ def patch_index_html(index_path: Path, register_filename: str, register_sri: str
 
     splash_css_path = PWA_DIR / "splash.css"
     splash_html_path = PWA_DIR / "splash.html"
-    if not splash_css_path.is_file():
-        raise SystemExit(f"error: missing splash stylesheet: {splash_css_path}")
-    if not splash_html_path.is_file():
-        raise SystemExit(f"error: missing splash markup: {splash_html_path}")
+    offline_lock_path = PWA_DIR / "offline-lock.js"
+    for req_path, label in (
+        (splash_css_path, "splash stylesheet"),
+        (splash_html_path, "splash markup"),
+        (offline_lock_path, "offline lock script"),
+    ):
+        if not req_path.is_file():
+            raise SystemExit(f"error: missing {label}: {req_path}")
 
     splash_css = splash_css_path.read_text(encoding="utf-8")
     if re.search(r"</style", splash_css, re.IGNORECASE):
         raise SystemExit(f"error: splash stylesheet must not contain '</style': {splash_css_path}")
+    offline_lock_js = offline_lock_path.read_text(encoding="utf-8")
+    if re.search(r"</script|<!--", offline_lock_js, re.IGNORECASE):
+        raise SystemExit(
+            f"error: offline lock script must not contain '</script' or '<!--': {offline_lock_path}"
+        )
+
     splash_html = splash_html_path.read_text(encoding="utf-8").strip()
+    lock_snippet = build_offline_lock_snippet(offline_lock_js)
     head_snippet = build_pwa_head_snippet(register_filename, register_sri, splash_css)
 
-    # Insert from back to front so earlier offsets stay valid.
-    body_off = locator.open_body_end_offset
+    # Keep <meta charset> within the HTML 1024-byte prescan window by inserting the
+    # pre-boot offline lock right after it (still before upstream's deferred module script).
+    lock_off = locator.charset_meta_end_offset or locator.open_head_end_offset
     head_off = locator.close_head_offset
-    if head_off >= body_off:
-        raise SystemExit(f"error: unexpected HTML tag order (</head> after <body>) in {index_path}")
+    body_off = locator.open_body_end_offset
+    if not (lock_off <= head_off < body_off):
+        raise SystemExit(f"error: unexpected HTML tag order in {index_path}")
     patched = (
-        f"{content[:head_off]}{head_snippet}\n  "
+        f"{content[:lock_off]}\n{lock_snippet}"
+        f"{content[lock_off:head_off]}{head_snippet}\n  "
         f"{content[head_off:body_off]}\n    {splash_html}"
         f"{content[body_off:]}"
     )
     index_path.write_text(patched, encoding="utf-8")
 
 
-def collect_cache_lists(out_dir: Path) -> tuple[list[str], dict[str, str], str, str]:
+def collect_cache_lists(out_dir: Path) -> tuple[list[str], dict[str, str], dict[str, str], str, str]:
     core_assets: list[str] = []
+    unhashed_core_hashes: dict[str, str] = {}
     model_hashes: dict[str, str] = {}
     core_hasher = hashlib.sha256()
     model_hasher = hashlib.sha256()
@@ -536,10 +573,13 @@ def collect_cache_lists(out_dir: Path) -> tuple[list[str], dict[str, str], str, 
                 model_hasher.update(f"{rel}:{digest}\n".encode("utf-8"))
         else:
             core_assets.append(rel_url)
+            if rel in ("index.html", "manifest.webmanifest") or rel.startswith("icons/"):
+                unhashed_core_hashes[rel_url] = digest
             core_hasher.update(f"{rel}:{digest}\n".encode("utf-8"))
 
     return (
         core_assets,
+        unhashed_core_hashes,
         model_hashes,
         core_hasher.hexdigest()[:10],
         model_hasher.hexdigest()[:10],
@@ -550,6 +590,7 @@ def render_service_worker(
     out_dir: Path,
     version: str,
     core_assets: list[str],
+    unhashed_core_hashes: dict[str, str],
     model_hashes: dict[str, str],
     core_hash: str,
     model_hash: str,
@@ -563,6 +604,7 @@ def render_service_worker(
         "__CORE_CACHE_SUFFIX__": json.dumps(core_suffix),
         "__MODELS_CACHE_SUFFIX__": json.dumps(models_suffix),
         "__CORE_ASSETS__": json.dumps(core_assets, indent=2),
+        "__UNHASHED_CORE_HASHES__": json.dumps(unhashed_core_hashes, indent=2, sort_keys=True),
         "__MODEL_HASHES__": json.dumps(model_hashes, indent=2, sort_keys=True),
     }
 
@@ -637,9 +679,9 @@ def main() -> int:
     register_sri = sri_sha384_file(out_dir / register_filename)
     patch_index_html(out_dir / "index.html", register_filename, register_sri)
 
-    core_assets, model_hashes, core_hash, model_hash = collect_cache_lists(out_dir)
+    core_assets, unhashed_core_hashes, model_hashes, core_hash, model_hash = collect_cache_lists(out_dir)
     core_suffix, models_suffix = render_service_worker(
-        out_dir, version, core_assets, model_hashes, core_hash, model_hash
+        out_dir, version, core_assets, unhashed_core_hashes, model_hashes, core_hash, model_hash
     )
 
     build_info = {

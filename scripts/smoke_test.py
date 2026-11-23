@@ -2,12 +2,15 @@
 """End-to-end smoke test for a built PdfCraft PWA bundle.
 
 Checks:
-  1. Required files, splash markup placement, manifest JSON, icons, HTTP MIME
-     types, SRI hashes on <link> and <script> tags, and ONNX model hashes.
+  1. Required files, <meta charset> / offline-lock / splash markup ordering,
+     manifest JSON, icons, HTTP MIME types, SRI hashes on <link> and <script>
+     tags, and ONNX model hashes.
   2. (With Playwright + Chromium) Live WebAssembly boot via ?control, splash
      screen dismissal, opening a generated 1-page PDF via ?file=, Service Worker
-     activation, core precache + background OCR model warmup, and a full offline
-     reload (including offline fetches of ./models/*.onnx).
+     activation, core precache + background OCR model warmup, full offline
+     reload (including offline fetches of ./models/*.onnx), and the Offline-only
+     toggle (blocking online requests including no-cors cross-origin and cold
+     SW restarts, persisting across reload with CSP, and unlocking cleanly).
 
 Usage:
   python3 scripts/smoke_test.py --dist dist
@@ -87,7 +90,7 @@ def make_minimal_pdf() -> bytes:
 
 
 class HtmlValidator(html.parser.HTMLParser):
-    """Collect SRI pairs, manifest link, register script, and splash placement."""
+    """Collect SRI pairs, manifest link, register script, offline-lock order, and splash placement."""
 
     def __init__(self, expected_register_script: str) -> None:
         super().__init__()
@@ -95,15 +98,25 @@ class HtmlValidator(html.parser.HTMLParser):
         self.items: list[tuple[str, str]] = []
         self.has_manifest = False
         self.has_register_script = False
+        self._in_head = False
         self._in_body = False
+        self._tag_index = 0
+        self.charset_order: int | None = None
+        self.offline_lock_order: int | None = None
+        self.first_module_order: int | None = None
         self.splash_in_body_count = 0
         self.splash_total_count = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._tag_index += 1
         attr_map = {k.lower(): (v or "") for k, v in attrs}
         t = tag.lower()
-        if t == "body":
+        if t == "head":
+            self._in_head = True
+        elif t == "body":
             self._in_body = True
+        if t == "meta" and self._in_head and "charset" in attr_map and self.charset_order is None:
+            self.charset_order = self._tag_index
         if attr_map.get("id") == "pdfcraft-splash":
             self.splash_total_count += 1
             if self._in_body:
@@ -114,13 +127,20 @@ class HtmlValidator(html.parser.HTMLParser):
             if attr_map.get("href") and attr_map.get("integrity"):
                 self.items.append((attr_map["href"], attr_map["integrity"]))
         elif t == "script":
+            if self._in_head and attr_map.get("id") == "pdfcraft-offline-lock" and self.offline_lock_order is None:
+                self.offline_lock_order = self._tag_index
+            if attr_map.get("type") == "module" and self.first_module_order is None:
+                self.first_module_order = self._tag_index
             if attr_map.get("src") == self.expected_register_script:
                 self.has_register_script = True
             if attr_map.get("src") and attr_map.get("integrity"):
                 self.items.append((attr_map["src"], attr_map["integrity"]))
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.lower() == "body":
+        t = tag.lower()
+        if t == "head":
+            self._in_head = False
+        elif t == "body":
             self._in_body = False
 
 
@@ -226,6 +246,15 @@ def run_static_checks(dist_dir: Path, base_url: str) -> dict:
     collector.feed(html_bytes.decode("utf-8"))
     assert collector.has_manifest, "manifest link missing from index.html"
     assert collector.has_register_script, f"{register_script} script missing from index.html"
+    assert collector.offline_lock_order is not None, "#pdfcraft-offline-lock script missing from <head>"
+    if collector.charset_order is not None:
+        assert collector.charset_order < collector.offline_lock_order, (
+            "<meta charset> must appear before #pdfcraft-offline-lock"
+        )
+    if collector.first_module_order is not None:
+        assert collector.offline_lock_order < collector.first_module_order, (
+            "#pdfcraft-offline-lock must appear before upstream <script type=module>"
+        )
     assert collector.splash_total_count == 1 and collector.splash_in_body_count == 1, (
         f"Expected #pdfcraft-splash once inside <body>, got total={collector.splash_total_count}, "
         f"in_body={collector.splash_in_body_count}"
@@ -329,7 +358,7 @@ def run_browser_checks(dist_dir: Path, base_url: str, build_info: dict, timeout_
         )
 
         # 1. Online boot with ?control and a generated 1-page PDF via ?file=
-        print("[1/3] Booting PdfCraft WASM and opening generated test PDF...")
+        print("[1/4] Booting PdfCraft WASM and opening generated test PDF...")
         page.goto(
             f"{base_url}/?control&file=./__smoke_test.pdf",
             wait_until="domcontentloaded",
@@ -348,7 +377,7 @@ def run_browser_checks(dist_dir: Path, base_url: str, build_info: dict, timeout_
         print("[OK] PdfCraft booted, dismissed splash screen, and opened __smoke_test.pdf")
 
         # 2. Verify Service Worker activation, core precache, and background OCR model warmup
-        print("[2/3] Waiting for Service Worker activation, core precache, and OCR model cache...")
+        print("[2/4] Waiting for Service Worker activation, core precache, and OCR model cache...")
         expected_suffix = build_info["core_cache_suffix"]
         expected_count = build_info["core_assets_count"]
         expected_models_suffix = build_info["models_cache_suffix"]
@@ -439,7 +468,7 @@ def run_browser_checks(dist_dir: Path, base_url: str, build_info: dict, timeout_
         )
 
         # 3. Offline reload test
-        print("[3/3] Switching offline and reloading from Service Worker cache...")
+        print("[3/4] Switching offline and reloading from Service Worker cache...")
         page_errors.clear()
         console_errors.clear()
         context.set_offline(True)
@@ -485,6 +514,147 @@ def run_browser_checks(dist_dir: Path, base_url: str, build_info: dict, timeout_
         print(
             f"[OK] Offline reload + {len(expected_model_sizes)} OCR model fetches succeeded from Service Worker cache"
         )
+
+        # 4. Offline-only mode toggle test (while browser is back ONLINE)
+        print("[4/4] Testing Offline-only toggle while browser is online...")
+        context.set_offline(False)
+        page.goto(f"{base_url}/?control", wait_until="domcontentloaded", timeout=timeout_ms)
+        wait_for_pdfcraft_api(page, timeout_ms=timeout_ms)
+        page.wait_for_function(
+            "() => { const b = document.getElementById('pdfcraft-net-pill'); return b && b.getAttribute('aria-disabled') === 'false'; }",
+            timeout=15_000,
+        )
+        page.click("#pdfcraft-net-pill")
+        page.wait_for_function(
+            "() => document.getElementById('pdfcraft-net-pill')?.getAttribute('aria-checked') === 'true'",
+            timeout=10_000,
+        )
+
+        # Verify network calls are blocked while online (using no-cors for cross-origin),
+        # yet cached OCR models still serve 200.
+        lock_probe = page.evaluate(
+            """async (cachedModelUrl) => {
+                const blocked = {};
+                for (const [label, fn] of [
+                    ['uncached_get', () => fetch('./__smoke_test.pdf')],
+                    ['uncached_post', () => fetch('./__smoke_test.pdf', { method: 'POST', body: 'x' })],
+                    ['cross_origin_no_cors', () => fetch('https://example.com/', { mode: 'no-cors' })],
+                ]) {
+                    try {
+                        await fn();
+                        blocked[label] = false;
+                    } catch {
+                        blocked[label] = true;
+                    }
+                }
+                try {
+                    new WebSocket('wss://example.com/');
+                    blocked.websocket = false;
+                } catch {
+                    blocked.websocket = true;
+                }
+                blocked.sendBeacon = navigator.sendBeacon ? navigator.sendBeacon('./__smoke_test.pdf', 'x') === false : true;
+                const cachedResp = await fetch(cachedModelUrl, { cache: 'no-cache' });
+                return {
+                    blocked,
+                    cachedStatus: cachedResp.status,
+                    cachedSize: (await cachedResp.arrayBuffer()).byteLength,
+                };
+            }""",
+            next(iter(expected_model_sizes.keys())),
+        )
+        assert all(lock_probe["blocked"].values()), f"Expected all network calls blocked: {lock_probe}"
+        first_model_size = next(iter(expected_model_sizes.values()))
+        assert lock_probe["cachedStatus"] == 200 and lock_probe["cachedSize"] == first_model_size, (
+            f"Cached model failed in Offline-only mode: {lock_probe}"
+        )
+
+        # Force-stop all Service Workers to verify cold-started SW still reads persisted Offline-only flag.
+        cdp = context.new_cdp_session(page)
+        cdp.send("ServiceWorker.enable")
+        cdp.send("ServiceWorker.stopAllWorkers")
+        cold_blocked = page.evaluate(
+            """async () => {
+                try {
+                    await fetch('./__smoke_test.pdf');
+                    return false;
+                } catch {
+                    return true;
+                }
+            }"""
+        )
+        assert cold_blocked, "Cold-restarted Service Worker failed to block uncached fetch in Offline-only mode"
+
+        # Reload while online: Offline-only must stay persisted ON, inject CSP meta, boot from cache, and keep blocking.
+        page_errors.clear()
+        page.goto(f"{base_url}/?control", wait_until="domcontentloaded", timeout=timeout_ms)
+        wait_for_pdfcraft_api(page, timeout_ms=timeout_ms)
+        page.wait_for_function("() => !document.getElementById('pdfcraft-splash')", timeout=10_000)
+        persisted = page.evaluate(
+            """async () => {
+                const pill = document.getElementById('pdfcraft-net-pill');
+                const csp = document.getElementById('pdfcraft-offline-csp');
+                let stillBlocked = false;
+                try {
+                    await fetch('./__smoke_test.pdf');
+                } catch {
+                    stillBlocked = true;
+                }
+                return {
+                    checked: pill ? pill.getAttribute('aria-checked') : null,
+                    hasCsp: Boolean(csp && csp.content.includes("connect-src 'self'")),
+                    stillBlocked,
+                };
+            }"""
+        )
+        assert persisted == {"checked": "true", "hasCsp": True, "stillBlocked": True}, (
+            f"Offline-only persistence check failed: {persisted}"
+        )
+        assert not page_errors, f"Uncaught page errors during persisted Offline-only boot: {page_errors}"
+
+        # Toggle back OFF and confirm uncached network requests work again.
+        page.click("#pdfcraft-net-pill")
+        page.wait_for_function(
+            "() => document.getElementById('pdfcraft-net-pill')?.getAttribute('aria-checked') === 'false'",
+            timeout=10_000,
+        )
+        restored_status = page.evaluate("async () => (await fetch('./__smoke_test.pdf')).status")
+        assert restored_status == 200, f"Expected HTTP 200 after disabling Offline-only, got {restored_status}"
+
+        # Drag the pill to a new position, confirm dragging does not trigger a toggle, and verify persistence across reload.
+        before_box = page.locator("#pdfcraft-net-pill").bounding_box()
+        assert before_box, "Pill bounding box missing"
+        cx = before_box["x"] + before_box["width"] / 2
+        cy = before_box["y"] + before_box["height"] / 2
+        page.mouse.move(cx, cy)
+        page.mouse.down()
+        page.mouse.move(cx + 160, cy - 120, steps=8)
+        page.mouse.up()
+        after_drag = page.locator("#pdfcraft-net-pill").bounding_box()
+        assert after_drag and abs(after_drag["x"] - (before_box["x"] + 160)) < 10, (
+            f"Pill did not move as expected: before={before_box}, after={after_drag}"
+        )
+        drag_state = page.evaluate(
+            """() => {
+                const key = window.__pdfcraftOffline ? window.__pdfcraftOffline.storageKey : '';
+                return {
+                    stored: key ? window.localStorage.getItem(key) : null,
+                    checked: document.getElementById('pdfcraft-net-pill')?.getAttribute('aria-checked'),
+                };
+            }"""
+        )
+        assert drag_state["stored"] != "1" and drag_state["checked"] == "false", (
+            f"Dragging the pill should not toggle Offline-only mode: {drag_state}"
+        )
+
+        page.goto(f"{base_url}/?control", wait_until="domcontentloaded", timeout=timeout_ms)
+        wait_for_pdfcraft_api(page, timeout_ms=timeout_ms)
+        page.wait_for_selector("#pdfcraft-net-pill", timeout=10_000)
+        after_reload = page.locator("#pdfcraft-net-pill").bounding_box()
+        assert after_reload and abs(after_reload["x"] - after_drag["x"]) < 5 and abs(after_reload["y"] - after_drag["y"]) < 5, (
+            f"Pill position did not persist across reload: dragged={after_drag}, reloaded={after_reload}"
+        )
+        print("[OK] Offline-only toggle blocked online requests, persisted across reload, unlocked cleanly, and pill drag persisted")
 
         browser.close()
 
